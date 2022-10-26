@@ -1,0 +1,97 @@
+---
+
+services:
+  # This service is used as a basis to generate a CA certificate and sign client
+  # certificates.
+  ssh-ca:
+    build:
+      target: ssh-ca
+    volumes:
+      - ./keys/ca:/home/user/.ssh
+      - ./keys/client:/home/user/client
+  # This service is used as a basis to generate a client certificate.
+  ssh-client:
+    build:
+      target: ssh-client
+    volumes:
+      - ./keys/client:/home/user/.ssh
+  # This service is used to generate a CA certificate.
+  generate-ca-cert:
+    extends: ssh-ca
+    environment:
+      ALGORITHM: rsa
+    entrypoint: ["bash", "-c"]
+    command:
+      - ssh-keygen -t $${ALGORITHM} -N '' -b 4096 -f '.ssh/id_rsa'
+  # This service is used to generate a client certificate.
+  generate-client-cert:
+    extends: ssh-client
+    environment:
+      ALGORITHM: rsa
+    entrypoint: ["bash", "-c"]
+    command:
+      - ssh-keygen -t $${ALGORITHM} -N '' -b 4096 -f '.ssh/id_rsa'
+  # This service is used to sign the client certificate with a validity period
+  # of five minutes for user root on any host.
+  sign-client-cert:
+    extends: ssh-ca
+    depends_on:
+      generate-ca-cert:
+        condition: service_completed_successfully
+      generate-client-cert:
+        condition: service_completed_successfully
+    entrypoint: ["bash", "-c"]
+    command:
+      - ssh-keygen -s '/home/user/.ssh/id_rsa' -V '+5m' -I 'Test User' -n 'root,any' /home/user/client/id_rsa.pub
+  # SSH server where the CA is configured in system-wide config.
+  ssh-server-system-wide-authority:
+    build:
+      target: ssh-server
+    depends_on:
+      generate-ca-cert:
+        condition: service_completed_successfully
+    volumes:
+      - ./keys/ca:/etc/ssh/ca:ro
+    hostname: ssh-server-system-wide-authority
+    entrypoint: [ "bash", "-c" ]
+    command:
+      - |
+        cat <<EOF >> /etc/ssh/sshd_config
+        TrustedUserCAKeys /etc/ssh/ca/id_rsa.pub
+        EOF
+
+        /etc/init.d/ssh start -D -E /dev/stdout
+  # SSH server where the CA is configured in the user-specific `authorized_keys`
+  # file.
+  ssh-server-local-authority:
+    build:
+      target: ssh-server
+    depends_on:
+      generate-ca-cert:
+        condition: service_completed_successfully
+    volumes:
+      - ./keys/ca:/etc/ssh/ca:ro
+    hostname: ssh-server-local-authority
+    entrypoint: [ "bash", "-c" ]
+    command:
+      - |
+        mkdir -p /root/.ssh
+
+        echo "cert-authority $$(cat /etc/ssh/ca/id_rsa.pub)" > /root/.ssh/authorized_keys
+
+        /etc/init.d/ssh start -D -E /dev/stdout
+  # This service is used to test the connection to both SSH servers.
+  ssh-client-test:
+    extends: ssh-client
+    depends_on:
+      sign-client-cert:
+        condition: service_completed_successfully
+      ssh-server-local-authority:
+        condition: service_healthy
+      ssh-server-system-wide-authority:
+        condition: service_healthy
+    entrypoint: [ "bash", "-c" ]
+    command:
+      - |
+        ssh -oStrictHostKeyChecking=false root@ssh-server-system-wide-authority "hostname && whoami"
+        ssh -oStrictHostKeyChecking=false root@ssh-server-local-authority "hostname && whoami"
